@@ -377,6 +377,112 @@ def check_all_zeroes(df):
     df_copy = df[numeric_cols].copy()
     df_copy = df_copy.fillna(0)
     return (df_copy == 0).all(axis=1)
+
+def generate_processed_dataframe(file_name):
+    """
+    Generate a processed DataFrame for a file using current session state selections.
+    This ensures column selections are always respected, even when navigating between steps.
+
+    Returns the processed DataFrame or None if required data is missing.
+    """
+    # Check if we have all required data
+    if file_name not in st.session_state.cfs_json_files:
+        return None
+    if file_name not in st.session_state.cfs_classifications:
+        return None
+    if file_name not in st.session_state.cfs_column_names:
+        return None
+
+    file_info = st.session_state.cfs_json_files[file_name]
+
+    # Get selected table indices
+    selected_table_indices = st.session_state.cfs_selected_tables.get(file_name, [0])
+
+    # Build the DataFrame from selected tables
+    if len(selected_table_indices) > 1:
+        combined_dfs = []
+        for idx in selected_table_indices:
+            if idx < len(file_info['tables']):
+                table_data = file_info['tables'][idx]
+                combined_dfs.append(pd.DataFrame(table_data))
+        if not combined_dfs:
+            return None
+        df = pd.concat(combined_dfs, ignore_index=True)
+    else:
+        if not file_info['tables']:
+            return None
+        table_idx = selected_table_indices[0] if selected_table_indices else 0
+        if table_idx >= len(file_info['tables']):
+            return None
+        df = pd.DataFrame(file_info['tables'][table_idx])
+
+    # Get account column
+    account_col_idx = st.session_state.cfs_account_column.get(file_name, 0)
+    if account_col_idx >= len(df.columns):
+        account_col_idx = 0
+    account_column = df.columns[account_col_idx]
+
+    # Get ONLY the selected value columns
+    selected_value_cols = st.session_state.cfs_selected_value_cols.get(file_name, [])
+    if not selected_value_cols:
+        # Fallback to all non-account columns if nothing selected
+        selected_value_cols = [c for c in df.columns if c != account_column]
+
+    # Filter to only valid columns that exist in df
+    selected_value_cols = [c for c in selected_value_cols if c in df.columns]
+
+    if not selected_value_cols:
+        return None
+
+    # Create final DataFrame with ONLY account column and selected value columns
+    final_df = df[[account_column] + selected_value_cols].copy()
+
+    # Add Label column from classifications
+    classifications = st.session_state.cfs_classifications[file_name]
+    final_df['Label'] = final_df.index.map(
+        lambda idx: classifications.get(idx, {}).get('category', 'Unclassified')
+    )
+
+    # Build column rename mapping
+    col_rename = {account_column: 'Account'}
+    column_names = st.session_state.cfs_column_names.get(file_name, {})
+    for orig_col in selected_value_cols:
+        if orig_col in column_names:
+            col_rename[orig_col] = column_names[orig_col]
+
+    final_df = final_df.rename(columns=col_rename)
+
+    # Reorder columns: Label, Account, then renamed period columns
+    period_cols = [col_rename.get(c, c) for c in selected_value_cols]
+    cols_order = ['Label', 'Account'] + period_cols
+    final_df = final_df[cols_order]
+
+    # Filter to only valid labels
+    valid_labels = ['Cash from Operations', 'Cash from Investing', 'Cash from Financing', 'Cash from other', 'Subtotal']
+    final_df = final_df[final_df['Label'].isin(valid_labels)]
+
+    # Apply units conversion
+    conversion_factors = {
+        "Actuals": 1,
+        "Thousands": 1000,
+        "Millions": 1000000,
+        "Billions": 1000000000
+    }
+    units = st.session_state.cfs_units_conversion.get(file_name, "Actuals")
+    conversion_factor = conversion_factors.get(units, 1)
+
+    # Convert numeric columns
+    numeric_cols = [c for c in final_df.columns if c not in ['Label', 'Account']]
+    for col in numeric_cols:
+        final_df[col] = final_df[col].apply(clean_numeric_value)
+        if conversion_factor != 1:
+            final_df[col] = final_df[col] * conversion_factor
+
+    # Sort by label order
+    final_df = sort_by_label_and_account(final_df, 'Account')
+
+    return final_df
+
 @st.cache_data
 def extract_tables_from_textract(data):
     """Extract tables from Textract JSON response.
@@ -1826,11 +1932,23 @@ Requirements:
                         st.divider()
                         # ===== STEP 4: Name Columns with Dropdowns and Manual Input =====
                         st.markdown("#### 📅 Step 4: Name Columns")
-                        # Initialize column names if not exists
+                        # Bug 2 Fix: Initialize column names only for selected columns and clean up deselected ones
                         if file_name not in st.session_state.cfs_column_names:
                             st.session_state.cfs_column_names[file_name] = {
-                                col: f"Period_{idx}" for idx, col in enumerate(numeric_cols)
+                                col: f"Period_{idx}" for idx, col in enumerate(selected_value_cols)
                             }
+                        else:
+                            # Clean up column names for deselected columns
+                            current_col_names = st.session_state.cfs_column_names[file_name]
+                            # Remove columns that are no longer selected
+                            st.session_state.cfs_column_names[file_name] = {
+                                col: name for col, name in current_col_names.items()
+                                if col in selected_value_cols
+                            }
+                            # Add default names for newly selected columns
+                            for idx, col in enumerate(selected_value_cols):
+                                if col not in st.session_state.cfs_column_names[file_name]:
+                                    st.session_state.cfs_column_names[file_name][col] = f"Period_{idx}"
                         st.markdown("Define what each numeric column represents:")
                         st.markdown("Choose from predefined periods or enter a custom name")
                         # Create period options
@@ -1906,17 +2024,27 @@ Requirements:
                         # ===== STEP 5: Results & Actions =====
                         st.markdown("#### ✅ Step 5: Results & Actions")
                         if file_name in st.session_state.cfs_classifications and st.session_state.cfs_column_names.get(file_name):
-                            # Create final processed DataFrame
-                            final_df = df.copy()
+                            # Bug 2 Fix: Get the user's selected value columns from Step 2
+                            selected_value_cols = st.session_state.cfs_selected_value_cols.get(file_name, [])
+
+                            # Create final processed DataFrame with ONLY account column and selected value columns
+                            final_df = df[[account_column] + selected_value_cols].copy()
                             final_df['Label'] = final_df.index.map(
                                 lambda idx: st.session_state.cfs_classifications[file_name].get(idx, {}).get('category', 'Unclassified')
                             )
-                            # Rename columns
+
+                            # Rename columns - only rename the account column and selected value columns
                             col_rename = {account_column: 'Account'}
-                            col_rename.update(st.session_state.cfs_column_names[file_name])
+                            # Only include renames for columns that are actually in selected_value_cols
+                            for orig_col in selected_value_cols:
+                                if orig_col in st.session_state.cfs_column_names.get(file_name, {}):
+                                    col_rename[orig_col] = st.session_state.cfs_column_names[file_name][orig_col]
+
                             final_df = final_df.rename(columns=col_rename)
-                            # Reorder columns: Label, Account, then periods
-                            cols_order = ['Label', 'Account'] + [c for c in final_df.columns if c not in ['Label', 'Account']]
+
+                            # Reorder columns: Label, Account, then ONLY the renamed selected periods
+                            period_cols = [col_rename.get(c, c) for c in selected_value_cols]
+                            cols_order = ['Label', 'Account'] + period_cols
                             final_df = final_df[cols_order]
                             # Filter to only keep valid labels (remove blank, unclassified, skip, etc.)
                             valid_labels = ['Cash from Operations', 'Cash from Investing', 'Cash from Financing', 'Cash from other', 'Subtotal']
@@ -2043,12 +2171,18 @@ Requirements:
                     st.session_state.removed_zero_rows = []
                     st.rerun()
             ready_count = len(st.session_state.cfs_ready_for_aggregation)
-            if ready_count > 0:
+            # Bug 1 Fix: Only show aggregate button when data hasn't been aggregated yet
+            if ready_count > 0 and st.session_state.cfs_aggregated_data is None:
                 if st.button("🚀 Aggregate Ready Files", type="primary", use_container_width=True):
                     ready_dfs = []
                     for fname in st.session_state.cfs_ready_for_aggregation:
-                        if fname in st.session_state.cfs_processed_data:
-                            ready_dfs.append(st.session_state.cfs_processed_data[fname])
+                        # Regenerate DataFrame using current selections instead of cached data
+                        # This ensures column selections (from Step 2) are always respected
+                        processed_df = generate_processed_dataframe(fname)
+                        if processed_df is not None and not processed_df.empty:
+                            ready_dfs.append(processed_df)
+                            # Also update the cache for consistency
+                            st.session_state.cfs_processed_data[fname] = processed_df
                     if ready_dfs:
                         with st.spinner("Aggregating data..."):
                             combined_df = pd.concat(ready_dfs, ignore_index=True)
@@ -2057,11 +2191,20 @@ Requirements:
                         st.success("✅ Aggregation complete!")
                         st.rerun()
                     else:
-                        st.warning("No processed data found for ready files")
+                        st.warning("No processed data found for ready files. Please ensure files have been classified and columns named.")
+            elif ready_count == 0 and st.session_state.cfs_aggregated_data is None:
+                st.info("No files ready for aggregation. Mark files ready in the Prep step.")
             if st.session_state.cfs_aggregated_data is not None:
                 st.markdown('<div class="main-header">📊 Aggregated Results</div>', unsafe_allow_html=True)
                 st.write("### Aggregated Data:")
                 st.dataframe(st.session_state.cfs_aggregated_data, use_container_width=True)
+
+                # Add Re-Aggregate button for when user changes column selections
+                if ready_count > 0:
+                    if st.button("🔄 Re-Aggregate with Current Selections", type="secondary", use_container_width=True, key="re_aggregate_btn"):
+                        st.session_state.cfs_aggregated_data = None
+                        st.rerun()
+
                 aggregated_table = st.session_state.cfs_aggregated_data
                 zero_rows = check_all_zeroes(aggregated_table)
                 zero_count = zero_rows.sum()
@@ -2437,12 +2580,18 @@ Requirements:
                                         index=default_choice,
                                         label_visibility="collapsed"
                                     )
-                                    st.session_state.cfs_user_selections[idx] = {
-                                        'choice': final_choice,
-                                        'manual': manual_selection if manual_selection != 'None' else None,
-                                        'fuzzy': matches['fuzzy'],
-                                        'llm': matches['llm']
-                                    }
+                                    # Bug 3 Fix: Only update state if the selection changed to prevent screen jitter
+                                    current_selection = st.session_state.cfs_user_selections.get(idx, {})
+                                    new_manual = manual_selection if manual_selection != 'None' else None
+                                    if (idx not in st.session_state.cfs_user_selections or
+                                        current_selection.get('choice') != final_choice or
+                                        current_selection.get('manual') != new_manual):
+                                        st.session_state.cfs_user_selections[idx] = {
+                                            'choice': final_choice,
+                                            'manual': new_manual,
+                                            'fuzzy': matches['fuzzy'],
+                                            'llm': matches['llm']
+                                        }
                                 st.divider()
                 st.markdown("### Mapping Summary")
                 total_items = len(st.session_state.cfs_mapping_results)
