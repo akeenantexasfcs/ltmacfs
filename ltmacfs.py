@@ -2188,6 +2188,7 @@ Requirements:
                             combined_df = pd.concat(ready_dfs, ignore_index=True)
                             aggregated_df = aggregate_data(combined_df)
                             st.session_state.cfs_aggregated_data = sort_by_label_and_account(aggregated_df, 'Account')
+                        st.success("✅ Aggregation complete!")
                         st.rerun()
                     else:
                         st.warning("No processed data found for ready files. Please ensure files have been classified and columns named.")
@@ -2197,6 +2198,13 @@ Requirements:
                 st.markdown('<div class="main-header">📊 Aggregated Results</div>', unsafe_allow_html=True)
                 st.write("### Aggregated Data:")
                 st.dataframe(st.session_state.cfs_aggregated_data, use_container_width=True)
+
+                # Add Re-Aggregate button for when user changes column selections
+                if ready_count > 0:
+                    if st.button("🔄 Re-Aggregate with Current Selections", type="secondary", use_container_width=True, key="re_aggregate_btn"):
+                        st.session_state.cfs_aggregated_data = None
+                        st.rerun()
+
                 aggregated_table = st.session_state.cfs_aggregated_data
                 zero_rows = check_all_zeroes(aggregated_table)
                 zero_count = zero_rows.sum()
